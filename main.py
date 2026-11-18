@@ -1,565 +1,350 @@
 import asyncio
 import logging
 import os
-import random
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatMemberStatus
-from aiogram.filters import Command, CommandObject
-from aiogram.types import ChatPermissions, Message
-from google import genai
+from aiogram import Bot, Dispatcher, Router
+from aiogram.enums import ChatType
+from aiogram.types import Message, ChatPermissions
+from aiogram.filters import CommandStart
+from dotenv import load_dotenv
+from groq import AsyncGroq
 
-# ============================================================
-# JOJO OVERDRIVE — Telegram group bot
-# Python 3.10+ | aiogram 3 | Google Gen AI SDK | SQLite
-# ============================================================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-DB_PATH = os.getenv("DB_PATH", "jojo_overdrive.db")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DB_PATH = "bot.db"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Add it to environment secrets.")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing. Add it to environment secrets.")
+    raise RuntimeError("Не найден BOT_TOKEN в .env")
+
+if not GROQ_API_KEY:
+    raise RuntimeError("Не найден GROQ_API_KEY в .env")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("jojo_overdrive")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-ai = genai.Client(api_key=GEMINI_API_KEY)
+router = Router()
+dp.include_router(router)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# ============================================================
-# DATABASE
-# ============================================================
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
 
-def connect_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA foreign_keys=ON")
 
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    custom_nick TEXT,
+    messages INTEGER NOT NULL DEFAULT 0,
+    xp INTEGER NOT NULL DEFAULT 0,
+    warns INTEGER NOT NULL DEFAULT 0,
+    joined_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 
-def init_db():
-    with connect_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT NOT NULL,
-                xp INTEGER NOT NULL DEFAULT 0,
-                warnings INTEGER NOT NULL DEFAULT 0,
-                joined_at TEXT NOT NULL,
-                last_xp TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS activity (
-                user_id INTEGER PRIMARY KEY,
-                messages INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS warnings_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                admin_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ai_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ai_history_user ON ai_history(user_id, id)"
-        )
+CREATE TABLE IF NOT EXISTS ai_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS moderation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    admin_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_history
+ON ai_history(chat_id, user_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_moderation
+ON moderation(chat_id, user_id);
+""")
+conn.commit()
 
 
-def save_user(user):
-    username = (user.username or "").lower() if hasattr(user, "username") else None
-    full_name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or str(user.id)
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO users (user_id, username, full_name, joined_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                full_name = excluded.full_name
-        """, (
-            user.id,
-            username,
-            full_name,
-            datetime.now(timezone.utc).isoformat(),
-        ))
+def db_execute(query, params=()):
+    cur = conn.execute(query, params)
+    conn.commit()
+    return cur
 
 
-def get_user(user_id):
-    with connect_db() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
+def now():
+    return datetime.now(timezone.utc)
 
 
-def get_user_by_username(username):
-    clean = username.lstrip("@").lower()
-    with connect_db() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE LOWER(username) = ?",
-            (clean,),
-        ).fetchone()
+def now_text():
+    return now().isoformat()
 
 
-def add_warning(user_id, admin_id, reason):
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO users (user_id, full_name, joined_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO NOTHING
-        """, (
-            user_id,
-            str(user_id),
-            datetime.now(timezone.utc).isoformat(),
-        ))
-        conn.execute(
-            "UPDATE users SET warnings = warnings + 1 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.execute("""
-            INSERT INTO warnings_log (user_id, admin_id, reason, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (
-            user_id,
-            admin_id,
-            reason,
-            datetime.now(timezone.utc).isoformat(),
-        ))
-
-
-def get_warning_count(user_id):
-    user = get_user(user_id)
-    return user["warnings"] if user else 0
-
-
-def clear_warnings(user_id):
-    with connect_db() as conn:
-        conn.execute(
-            "UPDATE users SET warnings = 0 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.execute(
-            "DELETE FROM warnings_log WHERE user_id = ?",
-            (user_id,),
-        )
-
-
-def get_warning_history(user_id):
-    with connect_db() as conn:
-        return conn.execute("""
-            SELECT reason, created_at
-            FROM warnings_log
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-        """, (user_id,)).fetchall()
-
-
-def increment_messages(user_id):
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO activity (user_id, messages)
-            VALUES (?, 1)
-            ON CONFLICT(user_id)
-            DO UPDATE SET messages = messages + 1
-        """, (user_id,))
-
-
-def message_count(user_id):
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT messages FROM activity WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-    return row["messages"] if row else 0
-
-
-def leaderboard(limit=10):
-    with connect_db() as conn:
-        return conn.execute("""
-            SELECT user_id, full_name, xp
-            FROM users
-            ORDER BY xp DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-
-
-# ============================================================
-# XP AND RANKS
-# ============================================================
-
-RANKS = [
-    (0, "Новичок"),
-    (100, "Ученик"),
-    (300, "Боец"),
-    (600, "Опытный боец"),
-    (1000, "Пользователь стенда"),
-    (2000, "Мастер стенда"),
-    (3500, "Легенда"),
-    (5000, "Повелитель времени"),
-]
-
-
-def rank_info(xp):
-    current = RANKS[0][1]
-    next_rank = None
-    for threshold, title in RANKS:
-        if xp >= threshold:
-            current = title
-        else:
-            next_rank = (threshold, title)
-            break
-    return current, next_rank
-
-
-def award_xp(user_id):
-    now = datetime.now(timezone.utc)
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT last_xp FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            return 0
-        if row["last_xp"]:
-            try:
-                previous = datetime.fromisoformat(row["last_xp"])
-                if now - previous < timedelta(seconds=60):
-                    return 0
-            except ValueError:
-                pass
-        amount = random.randint(3, 7)
-        conn.execute("""
-            UPDATE users
-            SET xp = xp + ?, last_xp = ?
-            WHERE user_id = ?
-        """, (amount, now.isoformat(), user_id))
-        return amount
-
-
-# ============================================================
-# USER TRACKING
-# ============================================================
-
-@dp.message(F.new_chat_members)
-async def welcome_new_members(message: Message):
-    for member in message.new_chat_members:
-        if member.is_bot:
-            continue
-        save_user(member)
-        await message.answer(
-            f"⚡ Добро пожаловать, {member.full_name}!\n"
-            "Ты присоединился к JOJO OVERDRIVE."
-        )
-
-
-@dp.message(F.from_user, F.text, ~F.text.startswith("/"))
-async def track_messages(message: Message):
-    user = message.from_user
+def ensure_user(chat_id, user):
     if not user or user.is_bot:
         return
-    save_user(user)
-    increment_messages(user.id)
-    award_xp(user.id)
+
+    timestamp = now_text()
+
+    db_execute("""
+    INSERT INTO users (
+        chat_id, user_id, username, first_name,
+        joined_at, last_seen
+    )
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id, user_id)
+    DO UPDATE SET
+        username=excluded.username,
+        first_name=excluded.first_name,
+        last_seen=excluded.last_seen
+    """, (
+        chat_id,
+        user.id,
+        user.username,
+        user.first_name or "Без имени",
+        timestamp,
+        timestamp
+    ))
 
 
-# ============================================================
-# GENERAL COMMANDS
-# ============================================================
+def add_message(chat_id, user):
+    ensure_user(chat_id, user)
 
-@dp.message(Command("start"))
-async def start_command(message: Message):
-    if message.from_user:
-        save_user(message.from_user)
-    await message.answer(
-        "⚡ JOJO OVERDRIVE\n\n"
-        "Бот сообщества по JoJo's Bizarre Adventure.\n"
-        "Напиши /help, чтобы увидеть список команд."
+    db_execute("""
+    UPDATE users
+    SET messages = messages + 1,
+        xp = xp + 1,
+        last_seen = ?
+    WHERE chat_id = ? AND user_id = ?
+    """, (now_text(), chat_id, user.id))
+
+
+def get_user(chat_id, user_id):
+    return conn.execute("""
+    SELECT * FROM users
+    WHERE chat_id = ? AND user_id = ?
+    """, (chat_id, user_id)).fetchone()
+
+
+def display_name(row):
+    if not row:
+        return "Неизвестный участник"
+
+    return (
+        row["custom_nick"]
+        or row["first_name"]
+        or row["username"]
+        or str(row["user_id"])
     )
 
 
-@dp.message(Command("help"))
-async def help_command(message: Message):
-    await message.answer(
-        "⚡ JOJO OVERDRIVE — КОМАНДЫ\n\n"
-        "👤 ПРОФИЛЬ И АКТИВНОСТЬ\n"
-        "/profile — твой профиль\n"
-        "/profile в ответ на сообщение — профиль участника\n"
-        "/rank — твой ранг\n"
-        "/top — топ-10 по XP\n\n"
-        "🤖 GEMINI\n"
-        "/ask вопрос — задать вопрос ИИ\n"
-        "/resetai — очистить свою историю ИИ\n\n"
-        "🛡 МОДЕРАЦИЯ (для администраторов)\n"
-        "/mute 10m — мут на время\n"
-        "/unmute — снять мут\n"
-        "/ban — заблокировать\n"
-        "/unban @username или ID — разбанить\n"
-        "/kick — исключить\n"
-        "/warn — предупреждение\n"
-        "/warnings — посмотреть предупреждения\n"
-        "/clearwarns — очистить предупреждения\n\n"
-        "Время мута: 30s, 10m, 2h, 1d."
+def find_user(chat_id, identifier):
+    identifier = identifier.strip()
+
+    if identifier.isdigit():
+        return get_user(chat_id, int(identifier))
+
+    username = identifier.lstrip("@").lower()
+
+    return conn.execute("""
+    SELECT * FROM users
+    WHERE chat_id = ? AND LOWER(username) = ?
+    LIMIT 1
+    """, (chat_id, username)).fetchone()
+
+
+def get_level(xp):
+    return max(1, int((xp / 100) ** 0.5) + 1)
+
+
+def get_rank(xp):
+    if xp >= 10000:
+        return "Выучивший/понявший все уроки Джайро"
+    if xp >= 9500:
+        return "Обладатель части трупа Иисуса"
+    if xp >= 9000:
+        return "Динозавр"
+    if xp >= 8500:
+        return "Учитель Спина"
+    if xp >= 8000:
+        return "Ученик Спина"
+    if xp >= 7500:
+        return "Обладатель стальных шаров"
+    if xp >= 7000:
+        return "Участник гонки Steel Ball Run"
+    if xp >= 6500:
+        return "Достигший Рая"
+    if xp >= 6000:
+        return "Сбежавший из G.D. st"
+    if xp >= 5500:
+        return "Священник G.D. st"
+    if xp >= 5000:
+        return "Заключённый G.D. st"
+    if xp >= 4500:
+        return "Дон Passione"
+    if xp >= 4000:
+        return "Убийца La Squadra"
+    if xp >= 3500:
+        return "Капо Passione"
+    if xp >= 3000:
+        return "Новичок Passione"
+    if xp >= 2500:
+        return "Защитник Морио"
+    if xp >= 2000:
+        return "Угроза, скрывающаяся в Морио"
+    if xp >= 1500:
+        return "Житель Морио"
+    if xp >= 1000:
+        return "Стардаст"
+    if xp >= 600:
+        return "Подсос ДИО"
+    if xp >= 300:
+        return "Обладатель стенда"
+    if xp >= 150:
+        return "Обладатель злого духа"
+    if xp >= 75:
+        return "Пиллармен"
+    if xp >= 50:
+        return "Учитель хамона"
+    if xp >= 25:
+        return "Ученик хамона"
+    if xp >= 0:
+        return "Новичок/вампир"
+    return "Новичок/вампир"
+
+
+def profile_text(chat_id, user_id):
+    row = get_user(chat_id, user_id)
+
+    if not row:
+        return "Профиль пока не создан. Напиши несколько сообщений!"
+
+    xp = row["xp"]
+    level = get_level(xp)
+    next_level_xp = (level ** 2) * 100
+
+    username = (
+        "@" + row["username"]
+        if row["username"]
+        else "Не указан"
+    )
+
+    return (
+        f"👤 ПРОФИЛЬ УЧАСТНИКА\n\n"
+        f"Имя: {display_name(row)}\n"
+        f"Telegram: {username}\n"
+        f"ID: {user_id}\n\n"
+        f"💬 Сообщений: {row['messages']}\n"
+        f"⭐ Опыт: {xp} XP\n"
+        f"🏅 Уровень: {level}\n"
+        f"🎖 Ранг: {get_rank(xp)}\n"
+        f"📈 До следующего уровня: "
+        f"{max(0, next_level_xp - xp)} XP\n"
+        f"⚠️ Предупреждений: {row['warns']}/3"
     )
 
 
-@dp.message(Command("profile"))
-async def profile_command(message: Message):
-    target = (
-        message.reply_to_message.from_user
-        if message.reply_to_message
-        else message.from_user
-    )
-    if not target:
-        return
-    save_user(target)
-    user = get_user(target.id)
-    xp = user["xp"]
-    title, next_rank = rank_info(xp)
-    progress = (
-        f"Следующий ранг: {next_rank[1]}\n"
-        f"До него: {next_rank[0] - xp} XP"
-        if next_rank
-        else "Достигнут максимальный ранг!"
-    )
-    await message.answer(
-        "👤 ПРОФИЛЬ УЧАСТНИКА\n\n"
-        f"Имя: {user['full_name']}\n"
-        f"ID: {target.id}\n"
-        f"Титул: {title}\n"
-        f"Опыт: {xp} XP\n"
-        f"Сообщений: {message_count(target.id)}\n"
-        f"Предупреждений: {user['warnings']}\n\n"
-        f"{progress}"
-    )
-
-
-@dp.message(Command("rank"))
-async def rank_command(message: Message):
-    if not message.from_user:
-        return
-    save_user(message.from_user)
-    user = get_user(message.from_user.id)
-    title, next_rank = rank_info(user["xp"])
-    text = f"⚔️ ТВОЙ РАНГ: {title}\nОпыт: {user['xp']} XP"
-    if next_rank:
-        text += (
-            f"\nСледующий ранг: {next_rank[1]}"
-            f"\nОсталось: {next_rank[0] - user['xp']} XP"
-        )
-    await message.answer(text)
-
-
-@dp.message(Command("top"))
-async def top_command(message: Message):
-    rows = leaderboard()
-    if not rows:
-        await message.answer("Пока рейтинг пуст.")
-        return
-    lines = ["🏆 ТОП-10 JOJO OVERDRIVE", ""]
-    for number, row in enumerate(rows, 1):
-        title, _ = rank_info(row["xp"])
-        lines.append(
-            f"{number}. {row['full_name']} — {row['xp']} XP ({title})"
-        )
-    await message.answer("\n".join(lines))
-
-
-# ============================================================
-# GEMINI AI WITH LOCAL CHAT HISTORY
-# ============================================================
-
-def load_ai_history(user_id, limit=10):
-    with connect_db() as conn:
-        rows = conn.execute("""
-            SELECT role, content
-            FROM ai_history
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (user_id, limit)).fetchall()
-    return list(reversed(rows))
-
-
-def save_ai_message(user_id, role, content):
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO ai_history (user_id, role, content, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (
-            user_id,
-            role,
-            content,
-            datetime.now(timezone.utc).isoformat(),
-        ))
-        conn.execute("""
-            DELETE FROM ai_history
-            WHERE user_id = ?
-            AND id NOT IN (
-                SELECT id FROM ai_history
-                WHERE user_id = ?
-                ORDER BY id DESC LIMIT 20
-            )
-        """, (user_id, user_id))
-
-
-@dp.message(Command("ask"))
-async def ask_command(message: Message, command: CommandObject):
-    question = (command.args or "").strip()
-    if not question:
-        await message.answer("Напиши вопрос: /ask Кто такой Джотаро?")
-        return
-    if not message.from_user:
-        return
-
-    user_id = message.from_user.id
-    history = load_ai_history(user_id)
-    prompt_lines = [
-        "Ты ИИ-ассистент сообщества JOJO OVERDRIVE.",
-        "Общайся естественно, дружелюбно и без канцелярита.",
-        "Хорошо разбирайся в JoJo, аниме, манге и других темах.",
-        "Не выдумывай факты. Отвечай на языке пользователя.",
-        "",
-    ]
-    for item in history:
-        prompt_lines.append(f"{item['role']}: {item['content']}")
-    prompt_lines.append(f"user: {question}")
-    prompt = "\n".join(prompt_lines)
-
-    await bot.send_chat_action(message.chat.id, "typing")
-    try:
-        response = await ai.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        answer = (response.text or "").strip()
-        if not answer:
-            answer = "Gemini не вернул текстовый ответ."
-        save_ai_message(user_id, "user", question)
-        save_ai_message(user_id, "assistant", answer)
-        for start in range(0, len(answer), 4000):
-            await message.answer(answer[start:start + 4000])
-    except Exception:
-        logger.exception("Gemini request failed")
-        await message.answer(
-            "⚠️ Не удалось получить ответ от Gemini. "
-            "Проверь API-ключ и доступность модели."
-        )
-
-
-@dp.message(Command("resetai"))
-async def reset_ai_command(message: Message):
-    if not message.from_user:
-        return
-    with connect_db() as conn:
-        conn.execute(
-            "DELETE FROM ai_history WHERE user_id = ?",
-            (message.from_user.id,),
-        )
-    await message.answer("🧹 История твоего общения с Gemini очищена.")
-
-
-# ============================================================
-# MODERATION HELPERS
-# ============================================================
-
-async def is_admin(message: Message):
+async def is_admin(message):
     if not message.from_user:
         return False
-    member = await bot.get_chat_member(
-        message.chat.id,
-        message.from_user.id,
-    )
-    return member.status in (
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    )
 
-
-async def require_admin(message: Message):
     try:
-        allowed = await is_admin(message)
+        member = await bot.get_chat_member(
+            message.chat.id,
+            message.from_user.id
+        )
+        return member.status in ("administrator", "creator")
     except Exception:
-        logger.exception("Could not check administrator status")
-        allowed = False
-    if not allowed:
-        await message.answer("⛔ Эта команда доступна только администраторам.")
         return False
-    return True
 
 
-async def resolve_target(message: Message, args=None):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user
+async def get_target(message, args):
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
 
-    parts = (args or "").split()
-    if not parts:
-        return None
+        if target:
+            ensure_user(message.chat.id, target)
+            return target.id, args
 
+    if not args:
+        return None, ""
+
+    parts = args.split(maxsplit=1)
     identifier = parts[0]
-    if identifier.startswith("@"):
-        row = get_user_by_username(identifier)
-        if not row:
-            return None
-        return SimpleNamespace(
-            id=row["user_id"],
-            full_name=row["full_name"],
-            username=row["username"],
-        )
 
-    try:
-        user_id = int(identifier)
-    except ValueError:
-        return None
+    if not identifier.startswith("@") and not identifier.isdigit():
+        return None, args
 
-    row = get_user(user_id)
-    return SimpleNamespace(
-        id=user_id,
-        full_name=row["full_name"] if row else str(user_id),
-        username=row["username"] if row else None,
+    row = find_user(message.chat.id, identifier)
+
+    if not row:
+        return None, args
+
+    remaining = parts[1] if len(parts) > 1 else ""
+    return row["user_id"], remaining
+
+
+def parse_duration(value):
+    value = value.lower().strip()
+
+    match = re.fullmatch(
+        r"(\d+)\s*(s|sec|m|min|h|hr|d|day|w|н|ч|м|д)",
+        value
     )
 
-
-def parse_duration(args):
-    match = re.search(r"(?<!\w)(\d+)\s*(s|m|h|d)\b", (args or "").lower())
     if not match:
         return None
-    value = int(match.group(1))
-    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    seconds = value * multiplier[match.group(2)]
+
+    number = int(match.group(1))
+    unit = match.group(2)
+
+    if number <= 0:
+        return None
+
+    multipliers = {
+        "s": 1,
+        "sec": 1,
+        "m": 60,
+        "min": 60,
+        "м": 60,
+        "h": 3600,
+        "hr": 3600,
+        "ч": 3600,
+        "d": 86400,
+        "day": 86400,
+        "д": 86400,
+        "w": 604800,
+        "н": 604800
+    }
+
+    seconds = number * multipliers[unit]
+
     if seconds < 30 or seconds > 366 * 86400:
         return None
+
     return seconds
 
 
-def format_duration(seconds):
+def duration_text(seconds):
     if seconds % 86400 == 0:
         return f"{seconds // 86400} дн."
     if seconds % 3600 == 0:
@@ -569,231 +354,576 @@ def format_duration(seconds):
     return f"{seconds} сек."
 
 
-# ============================================================
-# MUTE / UNMUTE
-# ============================================================
+def log_action(chat_id, user_id, admin_id, action, reason=""):
+    db_execute("""
+    INSERT INTO moderation (
+        chat_id, user_id, admin_id,
+        action, reason, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        chat_id,
+        user_id,
+        admin_id,
+        action,
+        reason,
+        now_text()
+    ))
 
-@dp.message(Command("mute"))
-async def mute_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
+
+MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False
+)
+
+UNMUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True
+)
+
+
+ALIASES = {
+    "проф": "profile",
+    "профиль": "profile",
+    "мут": "mute",
+    "размут": "unmute",
+    "бан": "ban",
+    "разбан": "unban",
+    "пред": "warn",
+    "предупреждение": "warn",
+    "предлист": "warnlist",
+    "кик": "kick",
+    "топ": "top",
+    "ранг": "rank"
+}
+
+COMMANDS = {
+    "profile", "mute", "unmute", "ban",
+    "unban", "warn", "warnlist", "kick",
+    "top", "rank"
+}
+
+
+async def moderation_command(message, command, args):
+    if not await is_admin(message):
+        await message.reply("⛔ Эта команда доступна только администраторам.")
         return
-    target = await resolve_target(message, command.args)
-    seconds = parse_duration(command.args)
 
-    if not target:
-        await message.answer(
-            "Не нашёл пользователя. Ответь на его сообщение "
-            "или используй сохранённый @username / ID."
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
+
+    target_id, remaining = await get_target(message, args)
+
+    if command == "top":
+        rows = conn.execute("""
+        SELECT * FROM users
+        WHERE chat_id = ?
+        ORDER BY xp DESC, messages DESC
+        LIMIT 10
+        """, (chat_id,)).fetchall()
+
+        if not rows:
+            await message.reply("Пока никто не набрал статистику.")
+            return
+
+        result = ["🏆 ТОП УЧАСТНИКОВ\n"]
+
+        for index, row in enumerate(rows, 1):
+            result.append(
+                f"{index}. {display_name(row)} — "
+                f"{row['xp']} XP | {row['messages']} сообщений"
+            )
+
+        await message.reply("\n".join(result))
+        return
+
+    if command == "profile":
+        target_id = message.from_user.id
+        await message.reply(profile_text(chat_id, target_id))
+        return
+
+    if command == "rank":
+        target_id = target_id or message.from_user.id
+        row = get_user(chat_id, target_id)
+
+        if not row:
+            await message.reply("Участник ещё не имеет статистики.")
+            return
+
+        await message.reply(
+            f"🏅 Ранг: {get_rank(row['xp'])}\n"
+            f"Уровень: {get_level(row['xp'])}\n"
+            f"Опыт: {row['xp']} XP"
         )
         return
-    if not seconds:
-        await message.answer(
-            "Укажи длительность мута:\n"
-            "/mute 30s\n/mute 10m\n/mute 2h\n/mute 1d\n"
-            "Минимум — 30 секунд."
+
+    if not target_id:
+        await message.reply(
+            "❗ Ответь на сообщение участника "
+            "или укажи его @username / ID."
         )
         return
 
-    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    try:
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until,
+    row = get_user(chat_id, target_id)
+    name = display_name(row) if row else str(target_id)
+
+    if command == "mute":
+        duration = 3600
+        reason = ""
+
+        if remaining:
+            parts = remaining.split(maxsplit=1)
+            parsed = parse_duration(parts[0])
+
+            if parsed is not None:
+                duration = parsed
+                reason = parts[1] if len(parts) > 1 else ""
+            else:
+                await message.reply(
+                    "❗ Неверное время. Примеры: 30m, 2h, 1d."
+                )
+                return
+
+        until = now() + timedelta(seconds=duration)
+
+        try:
+            await bot.restrict_chat_member(
+                chat_id,
+                target_id,
+                permissions=MUTE_PERMISSIONS,
+                until_date=until
+            )
+
+            log_action(
+                chat_id, target_id, admin_id,
+                "mute", reason
+            )
+
+            await message.reply(
+                f"🔇 {name} получил мут на "
+                f"{duration_text(duration)}."
+            )
+        except Exception as error:
+            await message.reply(f"Не удалось выдать мут: {error}")
+
+    elif command == "unmute":
+        try:
+            await bot.restrict_chat_member(
+                chat_id,
+                target_id,
+                permissions=UNMUTE_PERMISSIONS
+            )
+
+            log_action(chat_id, target_id, admin_id, "unmute")
+            await message.reply(f"🔊 {name} больше не в муте.")
+        except Exception as error:
+            await message.reply(f"Не удалось снять мут: {error}")
+
+    elif command == "ban":
+        reason = remaining or "Причина не указана"
+
+        try:
+            await bot.ban_chat_member(chat_id, target_id)
+
+            log_action(
+                chat_id, target_id, admin_id,
+                "ban", reason
+            )
+
+            await message.reply(
+                f"🔨 {name} забанен.\nПричина: {reason}"
+            )
+        except Exception as error:
+            await message.reply(f"Не удалось выдать бан: {error}")
+
+    elif command == "unban":
+        try:
+            await bot.unban_chat_member(
+                chat_id,
+                target_id,
+                only_if_banned=True
+            )
+
+            log_action(chat_id, target_id, admin_id, "unban")
+            await message.reply(f"✅ {name} разбанен.")
+        except Exception as error:
+            await message.reply(f"Не удалось снять бан: {error}")
+
+    elif command == "kick":
+        try:
+            await bot.ban_chat_member(chat_id, target_id)
+            await bot.unban_chat_member(
+                chat_id,
+                target_id,
+                only_if_banned=True
+            )
+
+            log_action(chat_id, target_id, admin_id, "kick")
+            await message.reply(f"👢 {name} исключён из чата.")
+        except Exception as error:
+            await message.reply(f"Не удалось исключить участника: {error}")
+
+    elif command == "warn":
+        reason = remaining or "Причина не указана"
+
+        ensure_target = conn.execute("""
+        SELECT user_id FROM users
+        WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, target_id)).fetchone()
+
+        if not ensure_target:
+            await message.reply(
+                "Сначала участник должен написать хотя бы одно сообщение."
+            )
+            return
+
+        db_execute("""
+        UPDATE users
+        SET warns = warns + 1
+        WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, target_id))
+
+        row = get_user(chat_id, target_id)
+        warns = row["warns"]
+
+        log_action(
+            chat_id, target_id, admin_id,
+            "warn", reason
         )
-        await message.answer(
-            f"🔇 {target.full_name} получил мут на "
-            f"{format_duration(seconds)}."
-        )
-    except Exception:
-        logger.exception("Mute failed")
-        await message.answer(
-            "❌ Не удалось выдать мут. Проверь права бота "
-            "и убедись, что цель не является администратором."
-        )
+
+        if warns >= 3:
+            try:
+                await bot.ban_chat_member(chat_id, target_id)
+
+                log_action(
+                    chat_id, target_id, admin_id,
+                    "ban", "Автоматический бан за 3 предупреждения"
+                )
+
+                await message.reply(
+                    f"🚫 {name} получил третье предупреждение "
+                    f"и автоматически забанен.\n"
+                    f"Причина последнего предупреждения: {reason}"
+                )
+            except Exception as error:
+                await message.reply(
+                    f"Получено 3/3 предупреждений, "
+                    f"но бан не удался: {error}"
+                )
+        else:
+            await message.reply(
+                f"⚠️ Предупреждение для {name}.\n"
+                f"Количество: {warns}/3\n"
+                f"Причина: {reason}"
+            )
+
+    elif command == "warnlist":
+        warnings = conn.execute("""
+        SELECT * FROM moderation
+        WHERE chat_id = ? AND user_id = ?
+        AND action = 'warn'
+        ORDER BY id DESC
+        LIMIT 20
+        """, (chat_id, target_id)).fetchall()
+
+        if not warnings:
+            await message.reply("У участника нет предупреждений.")
+            return
+
+        result = [f"⚠️ ПРЕДУПРЕЖДЕНИЯ: {name}\n"]
+
+        for index, item in enumerate(warnings, 1):
+            result.append(
+                f"{index}. {item['reason'] or 'Без причины'}"
+            )
+
+        await message.reply("\n".join(result))
 
 
-@dp.message(Command("unmute"))
-async def unmute_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
+async def set_nickname(message):
+    if not message.from_user:
         return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer("Укажи пользователя через ответ, @username или ID.")
-        return
-    try:
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_audios=True,
-                can_send_documents=True,
-                can_send_photos=True,
-                can_send_videos=True,
-                can_send_video_notes=True,
-                can_send_voice_notes=True,
-                can_send_polls=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            ),
-        )
-        await message.answer(f"🔊 Ограничение для {target.full_name} снято.")
-    except Exception:
-        logger.exception("Unmute failed")
-        await message.answer("❌ Не удалось снять мут.")
 
+    nickname = message.text[len("+ник"):].strip()
 
-# ============================================================
-# BAN / UNBAN / KICK
-# ============================================================
-
-@dp.message(Command("ban"))
-async def ban_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
-        return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer(
-            "Не нашёл пользователя. Ответь на сообщение "
-            "или используй сохранённый @username / ID."
-        )
-        return
-    try:
-        await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(f"🔨 {target.full_name} заблокирован.")
-    except Exception:
-        logger.exception("Ban failed")
-        await message.answer("❌ Не удалось заблокировать участника.")
-
-
-@dp.message(Command("unban"))
-async def unban_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
-        return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer(
-            "❌ Пользователь не найден в базе.\n"
-            "Сначала бот должен был увидеть его в группе, "
-            "чтобы сохранить username и ID."
+    if not nickname:
+        await message.reply(
+            "Использование: +ник"
         )
         return
-    try:
-        await bot.unban_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            only_if_banned=True,
-        )
-        await message.answer(f"🔓 {target.full_name} разблокирован.")
-    except Exception:
-        logger.exception("Unban failed")
-        await message.answer("❌ Не удалось выполнить разбан.")
 
-
-@dp.message(Command("kick"))
-async def kick_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
-        return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer("Укажи пользователя через ответ, @username или ID.")
-        return
-    try:
-        await bot.ban_chat_member(message.chat.id, target.id)
-        await bot.unban_chat_member(
-            message.chat.id,
-            target.id,
-            only_if_banned=True,
-        )
-        await message.answer(f"👢 {target.full_name} исключён из группы.")
-    except Exception:
-        logger.exception("Kick failed")
-        await message.answer("❌ Не удалось исключить участника.")
-
-
-# ============================================================
-# WARNINGS
-# ============================================================
-
-@dp.message(Command("warn"))
-async def warn_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
-        return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer("Укажи пользователя через ответ, @username или ID.")
+    if len(nickname) > 32:
+        await message.reply("Ник не может быть длиннее 32 символов.")
         return
 
-    parts = (command.args or "").split()
-    reason = " ".join(parts[1:]) if parts else ""
-    reason = reason or "Причина не указана"
+    ensure_user(message.chat.id, message.from_user)
 
-    add_warning(target.id, message.from_user.id, reason)
-    count = get_warning_count(target.id)
-    await message.answer(
-        f"⚠️ Предупреждение выдано.\n"
-        f"Участник: {target.full_name}\n"
-        f"Причина: {reason}\n"
-        f"Всего предупреждений: {count}"
+    db_execute("""
+    UPDATE users
+    SET custom_nick = ?
+    WHERE chat_id = ? AND user_id = ?
+    """, (
+        nickname,
+        message.chat.id,
+        message.from_user.id
+    ))
+
+    await message.reply(
+        f"✨ Твой новый ник: {nickname}"
     )
 
 
-@dp.message(Command("warnings"))
-async def warnings_command(message: Message, command: CommandObject):
-    target = await resolve_target(message, command.args)
-    if not target:
-        target = message.from_user
-    if not target:
+def save_ai_message(chat_id, user_id, role, content):
+    db_execute("""
+    INSERT INTO ai_history (
+        chat_id, user_id, role, content, created_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+    """, (
+        chat_id,
+        user_id,
+        role,
+        content[:6000],
+        now_text()
+    ))
+
+    db_execute("""
+    DELETE FROM ai_history
+    WHERE chat_id = ? AND user_id = ?
+    AND id NOT IN (
+        SELECT id FROM ai_history
+        WHERE chat_id = ? AND user_id = ?
+        ORDER BY id DESC LIMIT 16
+    )
+    """, (chat_id, user_id, chat_id, user_id))
+
+
+async def ask_groq(message, bot_username):
+    if not message.text or not bot_username:
         return
 
-    count = get_warning_count(target.id)
-    records = get_warning_history(target.id)
-    lines = [
-        "⚠️ ПРЕДУПРЕЖДЕНИЯ",
-        f"Участник: {target.full_name}",
-        f"Всего: {count}",
+    if not re.search(
+        rf"@{re.escape(bot_username)}\b",
+        message.text,
+        re.IGNORECASE
+    ):
+        return
+
+    question = re.sub(
+        rf"@{re.escape(bot_username)}\b",
         "",
+        message.text,
+        flags=re.IGNORECASE
+    ).strip()
+
+    if not question:
+        await message.reply("Что хотел спросить?")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    save_ai_message(chat_id, user_id, "user", question)
+
+    history = conn.execute("""
+    SELECT role, content FROM ai_history
+    WHERE chat_id = ? AND user_id = ?
+    ORDER BY id DESC LIMIT 12
+    """, (chat_id, user_id)).fetchall()
+
+    history = list(reversed(history))
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты — участник русскоязычного Telegram-сообщества. "
+                "Общайся естественно, живо и неформально. "
+                "Отвечай на русском языке, если собеседник "
+                "не попросил другой язык. Не представляйся "
+                "человеком. Не выдумывай факты. "
+                "Не повторяй вопрос без необходимости."
+            )
+        }
     ]
-    if records:
-        for index, record in enumerate(records, 1):
-            lines.append(f"{index}. {record['reason']}")
-    else:
-        lines.append("Предупреждений нет.")
-    await message.answer("\n".join(lines))
+
+    messages.extend([
+        {
+            "role": item["role"],
+            "content": item["content"]
+        }
+        for item in history
+    ])
+
+    try:
+        completion = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.8,
+            max_tokens=900
+        )
+
+        answer = completion.choices[0].message.content
+
+        if not answer:
+            answer = "Не получилось сформировать ответ."
+
+        save_ai_message(chat_id, user_id, "assistant", answer)
+
+        await message.reply(
+            answer[:4000],
+            disable_web_page_preview=True
+        )
+
+    except Exception:
+        logging.exception("Ошибка Groq API")
+        await message.reply(
+            "⚠️ Сейчас не получилось обратиться к нейросети."
+        )
 
 
-@dp.message(Command("clearwarns"))
-async def clearwarns_command(message: Message, command: CommandObject):
-    if not await require_admin(message):
-        return
-    target = await resolve_target(message, command.args)
-    if not target:
-        await message.answer("Укажи пользователя через ответ, @username или ID.")
-        return
-    clear_warnings(target.id)
+@router.message(CommandStart())
+async def start_command(message: Message):
     await message.answer(
-        f"✅ Предупреждения пользователя {target.full_name} очищены."
+        "Привет! Я бот сообщества JoJo Overdrive.\n\n"
+        "📊 /profile — твой профиль\n"
+        "🏆 /top — рейтинг участников\n"
+        "🎖 /rank — твой ранг\n\n"
+        "Для смены ника напиши: +ник НовыйНик\n"
+        "Чтобы обратиться к ИИ, упомяни меня через @username."
     )
 
 
-# ============================================================
-# STARTUP / SHUTDOWN
-# ============================================================
+@router.message()
+async def all_messages(message: Message):
+    if not message.from_user:
+        return
+
+    if message.from_user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    text = (message.text or message.caption or "").strip()
+
+    # Сохраняем каждого участника отдельно в каждом чате.
+    ensure_user(chat_id, message.from_user)
+
+    # Считаем каждое новое сообщение.
+    add_message(chat_id, message.from_user)
+
+    # Новые участники.
+    if message.new_chat_members:
+        for member in message.new_chat_members:
+            ensure_user(chat_id, member)
+
+    if not text:
+        return
+
+    # Пользовательский ник.
+    if text.lower().startswith("+ник"):
+        await set_nickname(message)
+        return
+
+    # Определяем команду.
+    parts = text.split(maxsplit=1)
+    raw_command = parts[0]
+    args = parts[1] if len(parts) > 1 else ""
+
+    if raw_command.startswith("/"):
+        command = raw_command[1:].split("@")[0].lower()
+    else:
+        command = ALIASES.get(raw_command.lower(), "")
+
+    if command in COMMANDS:
+        if command == "profile":
+            await message.reply(
+                profile_text(chat_id, message.from_user.id)
+            )
+            return
+
+        if command == "rank":
+            row = get_user(chat_id, message.from_user.id)
+
+            if not row:
+                await message.reply("У тебя пока нет статистики.")
+                return
+
+            await message.reply(
+                f"🏅 Твой ранг: {get_rank(row['xp'])}\n"
+                f"Уровень: {get_level(row['xp'])}\n"
+                f"Опыт: {row['xp']} XP"
+            )
+            return
+
+        await moderation_command(message, command, args)
+        return
+
+    # Топ доступен всем.
+    if command == "top":
+        rows = conn.execute("""
+        SELECT * FROM users
+        WHERE chat_id = ?
+        ORDER BY xp DESC, messages DESC
+        LIMIT 10
+        """, (chat_id,)).fetchall()
+
+        if not rows:
+            await message.reply("Пока нет статистики.")
+            return
+
+        result = ["🏆 ТОП УЧАСТНИКОВ\n"]
+
+        for index, row in enumerate(rows, 1):
+            result.append(
+                f"{index}. {display_name(row)} — {row['xp']} XP"
+            )
+
+        await message.reply("\n".join(result))
+        return
+
+    # Проверяем упоминание бота.
+    if not message.text:
+        return
+
+    try:
+        me = await bot.get_me()
+        await ask_groq(message, me.username)
+    except Exception:
+        logging.exception("Ошибка обработки упоминания бота")
+
 
 async def main():
-    init_db()
-    logger.info("JOJO OVERDRIVE is starting")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await ai.aio.aclose()
+    logging.info("Запуск JoJo Overdrive Bot")
+
+    me = await bot.get_me()
+
+    logging.info("Бот авторизован: @%s", me.username)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("JOJO OVERDRIVE stopped")
+        logging.info("Бот остановлен")
+    finally:
+        conn.close()
